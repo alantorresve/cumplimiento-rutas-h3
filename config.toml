@@ -1,0 +1,17 @@
+[spatial]
+crs_wgs84 = "EPSG:4326"
+h3_res = 8
+
+[paths]
+raw = "data/raw"
+processed = "data/processed"
+reports = "reports"
+
+[inputs]
+catalogo_rutas = "data/raw/catalogo_rutas_cid.csv"
+gps_csv = "data/raw/gps_monitoreo_17_sept_2025.csv"
+
+[metrics]
+umbral_compliance = 0.6      # % de puntos del trip que deben caer en la ruta dominante
+min_consistent_steps = 4      # pasos consecutivos para confirmar cambio de dirección
+gap_minutes = 30              # corte de trip por inactividad/gap de tiempo
