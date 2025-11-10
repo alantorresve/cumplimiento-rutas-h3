@@ -1,6 +1,6 @@
 [spatial]
 crs_wgs84 = "EPSG:4326"
-h3_res = 8
+h3_res = 7                       # ← hexágonos más grandes (puedes probar 6 si querés aún más grandes)
 
 [paths]
 raw = "data/raw"
@@ -12,6 +12,13 @@ catalogo_rutas = "data/raw/catalogo_rutas_cid.csv"
 gps_csv = "data/raw/gps_monitoreo_17_sept_2025.csv"
 
 [metrics]
-umbral_compliance = 0.6      # % de puntos del trip que deben caer en la ruta dominante
-min_consistent_steps = 4      # pasos consecutivos para confirmar cambio de dirección
-gap_minutes = 30              # corte de trip por inactividad/gap de tiempo
+umbral_compliance = 0.6          # 60% para considerar que el trip cumplió la ruta declarada
+gap_minutes = 30                  # corte por pausa larga
+
+# Inactividad (ruido)
+stationary_speed_kmh = 2.0        # ~quieto
+stationary_minutes = 30           # corte si quieto ≥ 30 min
+
+# Dominancia H3
+route_window_points = 9           # tamaño de ventana deslizante para ruta dominante
+route_switch_min_points = 6       # confirmación de cambio (histeresis)
