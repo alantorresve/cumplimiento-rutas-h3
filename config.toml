@@ -1,6 +1,6 @@
 [spatial]
 crs_wgs84 = "EPSG:4326"
-h3_res = 7                       # ← hexágonos más grandes (puedes probar 6 si querés aún más grandes)
+h3_res = 8                       # ← hexágonos más grandes (puedes probar 6 si querés aún más grandes)
 
 [paths]
 raw = "data/raw"
