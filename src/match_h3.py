@@ -1,12 +1,11 @@
-# =====================================================
-# src/match_h3.py  — Ruta primero, trip después (¡sin duplicados!)
-# =====================================================
+# ================== Utilidades y funciones ==================
+from __future__ import annotations
 from pathlib import Path
 import numpy as np
 import pandas as pd
 from src.config import load_config
 
-# --- Compatibilidad H3 v3/v4 ---
+# -------- H3 compat (v3/v4) --------
 try:
     import h3 as _h3
     if hasattr(_h3, "latlng_to_cell"):  # v4
@@ -18,19 +17,19 @@ except ImportError:
     from h3 import h3 as _h3v3
     def h3_cell(lat, lon, res): return _h3v3.geo_to_h3(lat, lon, res)
 
-
-# ---------------- Utilidades básicas ----------------
+# --------- Fechas / limpieza ----------
 def normalize_datetimes(df, col="fecha_hora"):
-    """Parsea fechas a UTC, descarta inválidas."""
-    dt = pd.to_datetime(df[col], errors="coerce", utc=True)
+    dt = pd.to_datetime(df[col], errors="coerce")
     df = df.loc[dt.notna()].copy()
     df[col] = dt[dt.notna()]
     return df
 
 def drop_point_duplicates(df):
-    """Quita duplicados exactos para no inflar puntos."""
-    return df.drop_duplicates(subset=["agency_id","mean_id","fecha_hora","latitude","longitude"]).copy()
+    return df.drop_duplicates(
+        subset=["agency_id","mean_id","fecha_hora","latitude","longitude","route_id"]
+    ).copy()
 
+# --------- Velocidad (para cortes) ----------
 def haversine_km(lat1, lon1, lat2, lon2):
     R = 6371.0088
     lat1, lon1, lat2, lon2 = map(np.radians, [lat1,lon1,lat2,lon2])
@@ -41,12 +40,10 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return R * c
 
 def compute_speed_kmh(df):
-    """Velocidad aprox entre puntos consecutivos del mismo bus (km/h)."""
     df = df.sort_values(["agency_id","mean_id","fecha_hora"]).copy()
     lat_prev = df.groupby(["agency_id","mean_id"])["latitude"].shift()
     lon_prev = df.groupby(["agency_id","mean_id"])["longitude"].shift()
     t_prev   = df.groupby(["agency_id","mean_id"])["fecha_hora"].shift()
-
     dist_km = haversine_km(df["latitude"], df["longitude"], lat_prev, lon_prev)
     dt_h = (df["fecha_hora"] - t_prev).dt.total_seconds() / 3600.0
     speed = dist_km / dt_h
@@ -54,85 +51,27 @@ def compute_speed_kmh(df):
     df["speed_kmh"] = speed
     return df
 
+# --------- Service day (hora Paraguay) ----------
+def add_service_day_py(df, col="fecha_hora"):
+    # si ya tiene tz, convertimos; si no, asumimos UTC y convertimos
+    if getattr(df[col].dtype, "tz", None) is None:
+        dt = pd.to_datetime(df[col], errors="coerce", utc=True)
+    else:
+        dt = df[col]
+    df["service_day"] = dt.dt.tz_convert("America/Asuncion").dt.date
+    return df
 
-# ---------------- H3 → rutas (sin duplicar filas) ----------------
-def build_h3_routes_map(rutas_df):
-    """
-    Devuelve un dict: h3_index (str) -> set({ruta_hex, ...})
-    a partir de rutas_h3.parquet (col 'h3_list', 'ruta_hex').
-    """
-    rutas_hex = rutas_df.explode("h3_list")[["ruta_hex","h3_list"]].dropna()
-    rutas_hex["h3_list"] = rutas_hex["h3_list"].astype(str)
-    mapping = {}
-    for h, group in rutas_hex.groupby("h3_list"):
-        mapping[h] = set(group["ruta_hex"].astype(str))
-    return mapping
-
-def candidate_routes_for_point(h3_idx, h3_to_routes):
-    """Conjunto de rutas candidatas que contienen este h3 (puede ser vacío)."""
-    return list(h3_to_routes.get(str(h3_idx), []))
-
-
-# ---------------- Ruta dominante por ventana ----------------
-def rolling_route_label(route_candidates_series, window_points, min_persist_points):
-    """
-    route_candidates_series: Serie de listas (candidatos por punto) ordenada por tiempo.
-    Regresa una Serie con una etiqueta de ruta dominante por punto (str o NaN),
-    usando ventana de tamaño 'window_points' y confirmación por 'min_persist_points'
-    (histeresis) para evitar saltos por ruido.
-    """
-    n = len(route_candidates_series)
-    labels = [None] * n
-
-    # Función para ruta mayoritaria en una ventana de listas
-    def window_mode(i):
-        a = max(0, i - window_points//2)
-        b = min(n, i + window_points//2 + 1)
-        counts = {}
-        for lst in route_candidates_series.iloc[a:b]:
-            if isinstance(lst, list):
-                for r in lst:
-                    counts[r] = counts.get(r, 0) + 1
-        if not counts:
-            return None
-        # ruta más frecuente en la ventana
-        return max(counts, key=counts.get)
-
-    # generar label tentativa por ventana
-    tentative = [window_mode(i) for i in range(n)]
-
-    # aplicar histeresis: confirmar cambios solo si se sostienen 'min_persist_points'
-    current = tentative[0]
-    consec_new = 0
-    for i in range(n):
-        lab = tentative[i]
-        if lab == current or current is None:
-            current = lab if current is None else current
-            consec_new = 0
-        else:
-            consec_new += 1
-            if consec_new >= min_persist_points:
-                current = lab
-                consec_new = 0
-        labels[i] = current
-    return pd.Series(labels, index=route_candidates_series.index, dtype="object")
-
-
-# ---------------- Trips dentro de bloques de ruta ----------------
-def split_trips_within_route_blocks(df, gap_minutes, stationary_kmh, stationary_minutes):
-    """
-    Dentro de cada (agency_id, mean_id, service_day, ruta_hex) corta el trip cuando:
-      - hay gap > gap_minutes, o
-      - inactividad sostenida (speed < stationary_kmh) acumulada >= stationary_minutes
-    """
-    df = df.sort_values(["agency_id","mean_id","service_day","fecha_hora"]).copy()
+# --------- Segmentación de trips (route_id, gap, velocidad) ----------
+def split_trips_by_gap_and_speed(df, gap_minutes, stationary_kmh, stationary_minutes):
+    df = df.sort_values(["agency_id","mean_id","service_day","route_id","fecha_hora"]).copy()
     df = compute_speed_kmh(df)
 
     gap = pd.Timedelta(minutes=gap_minutes)
     stationary_thresh_h = stationary_minutes / 60.0
     df["trip_id"] = -1
 
-    for keys, grp in df.groupby(["agency_id","mean_id","service_day","ruta_hex"], sort=False):
+    group_keys = ["agency_id","mean_id","service_day","route_id"]
+    for keys, grp in df.groupby(group_keys, sort=False):
         idx = grp.index.to_list()
         if not idx:
             continue
@@ -146,14 +85,14 @@ def split_trips_within_route_blocks(df, gap_minutes, stationary_kmh, stationary_
             t_cur  = df.at[i_cur,  "fecha_hora"]
             dt = t_cur - t_prev
 
-            # gap temporal
+            # Corte por gap
             if pd.notna(dt) and dt > gap:
                 current_trip += 1
                 quiet_hours_acc = 0.0
                 df.at[i_cur, "trip_id"] = current_trip
                 continue
 
-            # inactividad sostenida
+            # Acumulación de inactividad (velocidad baja)
             spd = df.at[i_cur, "speed_kmh"]
             dt_h = (dt.total_seconds()/3600.0) if pd.notna(dt) else 0.0
             if pd.notna(spd) and spd < stationary_kmh:
@@ -169,139 +108,190 @@ def split_trips_within_route_blocks(df, gap_minutes, stationary_kmh, stationary_
 
     return df
 
+# --------- Ruta declarada → camino H3 (ordenado) ----------
+def build_routeid_to_h3path(rutas_df, col_route="route_id", col_alt="ruta_hex", col_list="h3_list"):
+    # Soporta parquet con 'route_id' o 'ruta_hex' como identificador
+    if col_route not in rutas_df.columns and col_alt in rutas_df.columns:
+        col_route = col_alt
+    out = {}
+    tmp = rutas_df[[col_route, col_list]].dropna().copy()
+    for _, row in tmp.iterrows():
+        r = str(row[col_route]).strip().upper()  # normalizar clave de ruta
 
-# ---------------- Pipeline principal ----------------
+        seq = row[col_list]
+        # convertir numpy.ndarray a lista
+        if isinstance(seq, np.ndarray):
+            seq = seq.tolist()
+        # asegurar lista de strings (minúsculas para H3)
+        if isinstance(seq, (list, tuple)):
+            seq = [str(x).lower() for x in seq]
+
+        out[r] = seq
+    return out
+
+# --------- Secuencia H3 del trip (comprimida sin repeticiones consecutivas) ----------
+def trip_h3_sequence(df_trip, res):
+    hseq = []
+    prev = None
+    for la, lo in zip(df_trip["latitude"], df_trip["longitude"]):
+        h = str(h3_cell(la, lo, res)).lower()  # h3 en minúsculas
+        if h != prev:
+            hseq.append(h)
+            prev = h
+    return hseq
+
+# --------- Métricas hexagonales por trip (match por conjunto, no orden) ----------
+def summarize_trip_hex_metrics(df_trip, ref_seq, trip_seq):
+    # Conjunto único de hex del trip
+    trip_set = set(trip_seq)
+    trip_len = len(trip_set)
+
+    # Conjunto de referencia
+    ref_set = set(ref_seq) if isinstance(ref_seq, (list, tuple)) else set()
+    inter = trip_set & ref_set
+    pts_en_declared = len(inter)
+
+    ratio = (pts_en_declared / trip_len) if trip_len else np.nan
+
+    t0 = df_trip["fecha_hora"].min()
+    hora = pd.NaT if pd.isna(t0) else int(pd.to_datetime(t0).hour)
+
+    return {
+        "pts_trip": trip_len,             # hex únicos del viaje
+        "pts_en_declared": pts_en_declared,
+        "ratio": ratio,
+        "hora": hora
+    }
+
+# --------- Flag por punto: está en los hex de la ruta declarada ----------
+def compute_in_declared_per_point(df, routeid_to_path):
+    # Precompute sets para velocidad
+    ref_sets = {rid: set(seq) for rid, seq in routeid_to_path.items()}
+    out = []
+    for rid, h in zip(df["route_id"], df["h3"]):
+        seq_set = ref_sets.get(str(rid).strip().upper(), None)
+        if not seq_set:
+            out.append(False)
+        else:
+            out.append(str(h).lower() in seq_set)
+    return pd.Series(out, index=df.index, dtype=bool)
+
 def main():
-    cfg = load_config()
+    # ---- config ----
+    cfg = load_config()  # TOML
+    res = int(cfg["spatial"].get("h3_res", 8))
 
-    # --- parámetros (con defaults mejorados) ---
-    # Hexágonos más grandes por defecto (7); puedes subir a 6 si querés aún más grandes.
-    res = int(cfg["spatial"].get("h3_res", 7))
-
-    umbral = float(cfg["metrics"].get("umbral_compliance", 0.6))  # 60%
+    umbral = float(cfg["metrics"].get("umbral_compliance", 0.6))
     gap_minutes = int(cfg["metrics"].get("gap_minutes", 30))
-
-    # Inactividad / ruido
-    stationary_kmh = float(cfg["metrics"].get("stationary_speed_kmh", 2.0))    # quieto ~2 km/h
-    stationary_minutes = int(cfg["metrics"].get("stationary_minutes", 30))     # 30 min
-
-    # Dominancia H3 (ventana y persistencia)
-    route_window_points = int(cfg["metrics"].get("route_window_points", 9))        # tamaño ventana
-    route_switch_min_points = int(cfg["metrics"].get("route_switch_min_points", 6))# confirmación cambio
+    stationary_kmh = float(cfg["metrics"].get("stationary_speed_kmh", 2.0))
+    stationary_minutes = int(cfg["metrics"].get("stationary_minutes", 30))
+    min_trip_hex = int(cfg["metrics"].get("min_trip_hex", 3))  # mínimo hex únicos para considerar viaje
 
     processed = Path(cfg["paths"]["processed"])
     processed.mkdir(parents=True, exist_ok=True)
 
-    # 1) Rutas H3
+    # ---- rutas (referencia) ----
     rutas = pd.read_parquet(processed / "rutas_h3.parquet")
-    h3_to_routes = build_h3_routes_map(rutas)
+    rutas["ruta_hex"] = rutas["ruta_hex"].astype(str).str.upper()   # normalizar IDs
 
-    # 2) GPS
+    # usar SIEMPRE ruta_hex como clave del mapping
+    routeid_to_path = build_routeid_to_h3path(
+        rutas, col_route="ruta_hex", col_alt="ruta_hex", col_list="h3_list"
+    )
+
+    # detectar resolución H3 del parquet (soporta list o ndarray)
+    try:
+        sample_seq = next(seq for seq in rutas["h3_list"]
+                          if (isinstance(seq, (list, tuple)) and len(seq) > 0)
+                          or (isinstance(seq, np.ndarray) and seq.size > 0))
+        sample_first = str(sample_seq[0]).lower()
+        try:
+            import h3 as _h3
+            if hasattr(_h3, "get_resolution"):        # h3 v4
+                res = _h3.get_resolution(sample_first)
+            else:                                      # h3 v3
+                from h3 import h3 as _h3v3
+                res = _h3v3.h3_get_resolution(sample_first)
+        except Exception:
+            pass  # si falla, se mantiene el res de config
+    except StopIteration:
+        pass
+
+    # ---- gps ----
     gps_path = Path(cfg["inputs"]["gps_csv"])
     gps = pd.read_csv(gps_path)
 
-    # Limpieza básica: fechas válidas, sin duplicados, orden
     gps = normalize_datetimes(gps, col="fecha_hora")
     gps = drop_point_duplicates(gps)
-    gps = gps.sort_values(["agency_id","mean_id","fecha_hora"]).reset_index(drop=True)
+    gps = gps.sort_values(["agency_id", "mean_id", "fecha_hora"]).reset_index(drop=True)
+    gps = add_service_day_py(gps, col="fecha_hora")
+    gps["route_id"] = gps["route_id"].astype(str).str.upper()       # normalizar IDs
 
-    # 3) H3 por punto (hexágono más grande)
-    gps["h3"] = gps.apply(lambda r: h3_cell(r["latitude"], r["longitude"], res), axis=1).astype(str)
+    # h3 por punto (misma resolución que rutas)
+    gps["h3"] = [str(h3_cell(la, lo, res)).lower() for la, lo in zip(gps["latitude"], gps["longitude"])]
 
-    # Día de servicio (para cortar por días)
-    gps["service_day"] = gps["fecha_hora"].dt.tz_convert("UTC").dt.date
+    # in_declared por punto (conjunto de la ruta declarada)
+    gps["in_declared"] = compute_in_declared_per_point(gps, routeid_to_path)
 
-    # 4) Rutas candidatas por punto (lista) — sin duplicar filas
-    gps["route_candidates"] = gps["h3"].apply(lambda h: candidate_routes_for_point(h, h3_to_routes))
-
-    # 5) Ruta dominante por ventana, por (agencia, bus, día)
-    gps["ruta_hex"] = None  # etiqueta de ruta real (dominante) por punto
-    for keys, grp in gps.groupby(["agency_id","mean_id","service_day"], sort=False):
-        idx = grp.index
-        labels = rolling_route_label(gps.loc[idx,"route_candidates"], route_window_points, route_switch_min_points)
-        gps.loc[idx, "ruta_hex"] = labels
-
-    # 6) Trips dentro de bloques de ruta
-    gps = split_trips_within_route_blocks(
+    # ---- trips por (agency_id, mean_id, service_day, route_id) ----
+    gps = split_trips_by_gap_and_speed(
         gps,
         gap_minutes=gap_minutes,
         stationary_kmh=stationary_kmh,
-        stationary_minutes=stationary_minutes
+        stationary_minutes=stationary_minutes,
     )
 
-    # 7) Métricas por trip (sin duplicar puntos)
-    grp_keys = ["agency_id","mean_id","trip_id"]
+    # ---- resumen por trip (match hex por conjunto) ----
+    grp_keys = ["agency_id", "mean_id", "service_day", "route_id", "trip_id"]
+    trip_rows = []
+    for keys, grp in gps.groupby(grp_keys, sort=False):
+        _, _, _, rid, tid = keys
+        ref_seq = routeid_to_path.get(str(rid).strip().upper(), [])
+        trip_seq = trip_h3_sequence(grp, res)
+        metrics = summarize_trip_hex_metrics(grp, ref_seq, trip_seq)
 
-    # puntos cuyo H3 incluye la ruta declarada (cumplimiento vs 'route_id')
-    def in_declared(row):
-        rid = str(row.get("route_id"))
-        cands = row.get("route_candidates") or []
-        return rid in [str(x) for x in cands]
+        # aplicar mínimo de hex únicos para considerar viaje
+        effective_match = bool(metrics["ratio"] >= umbral and metrics["pts_trip"] >= min_trip_hex)
 
-    gps["in_declared"] = gps.apply(in_declared, axis=1)
+        trip_rows.append({
+            "agency_id": keys[0],
+            "mean_id": keys[1],
+            "trip_id": tid,
+            "route_id": str(rid),
+            "ruta_hex": str(rid),  # compat
+            "pts_en_declared": metrics["pts_en_declared"],
+            "pts_trip": metrics["pts_trip"],
+            "ratio": metrics["ratio"],
+            "trip_match": effective_match,
+            "route_id_match": effective_match,
+            "hora": metrics["hora"],
+        })
+    trips = pd.DataFrame(trip_rows)
 
-    # totales
-    trip_tot = gps.groupby(grp_keys, as_index=False).size().rename(columns={"size":"pts_trip"})
-    trip_declared = gps.groupby(grp_keys, as_index=False)["in_declared"].sum().rename(columns={"in_declared":"pts_en_declared"})
-
-    # ruta dominante REAL del trip (modo sobre 'ruta_hex' por punto)
-    trip_real = (
-        gps.dropna(subset=["ruta_hex"])
-           .groupby(grp_keys + ["ruta_hex"], as_index=False)
-           .size()
-    )
-    if len(trip_real):
-        dom_idx = trip_real.groupby(grp_keys)["size"].idxmax()
-        trip_real_dom = trip_real.loc[dom_idx, grp_keys + ["ruta_hex"]]
-    else:
-        trip_real_dom = pd.DataFrame(columns=grp_keys + ["ruta_hex"])
-
-    # route_id declarado dominante del trip (por si mezcla etiquetas)
-    trip_declared_mode = (
-        gps.groupby(grp_keys + ["route_id"], as_index=False).size()
-    )
-    decl_idx = trip_declared_mode.groupby(grp_keys)["size"].idxmax()
-    trip_declared_mode = trip_declared_mode.loc[decl_idx, grp_keys + ["route_id"]]
-
-    # hora de inicio del trip
-    trip_start = (
-        gps.groupby(grp_keys, as_index=False)["fecha_hora"]
-           .min()
-           .rename(columns={"fecha_hora":"trip_start"})
-    )
-    trip_start["hora"] = trip_start["trip_start"].dt.hour.astype("Int64")
-
-    # armar resumen trips
-    trips = (trip_tot
-             .merge(trip_declared, on=grp_keys, how="left")
-             .merge(trip_real_dom, on=grp_keys, how="left")
-             .merge(trip_declared_mode, on=grp_keys, how="left")
-             .merge(trip_start[grp_keys + ["hora"]], on=grp_keys, how="left"))
-
-    trips["pts_en_declared"] = trips["pts_en_declared"].fillna(0)
-    trips["ratio"] = trips["pts_en_declared"] / trips["pts_trip"]
-    trips["trip_match"] = trips["ratio"] >= umbral
-    trips["route_id_match"] = trips["ruta_hex"].astype(str) == trips["route_id"].astype(str)
-
-    # 8) Exportar — sin duplicar puntos
+    # ---- exportar (mismo formato) ----
     out_points = processed / "gps_match_points.parquet"
     cols_points = [
-        "agency_id","mean_id","trip_id","service_day","fecha_hora",
-        "latitude","longitude","h3","route_id","ruta_hex",
-        "route_candidates","in_declared"
+        "agency_id", "mean_id", "trip_id", "service_day", "fecha_hora",
+        "latitude", "longitude", "h3", "route_id", "ruta_hex",
+        "route_candidates", "in_declared",
     ]
+    # compat: 'ruta_hex' = route_id; 'route_candidates' vacío
+    gps["ruta_hex"] = gps["route_id"].astype(str)
+    gps["route_candidates"] = [[] for _ in range(len(gps))]
+
     gps[cols_points].to_parquet(out_points)
 
     out_trips = processed / "gps_match_trips.parquet"
     cols_trips = [
-        "agency_id","mean_id","trip_id","route_id","ruta_hex",
-        "pts_en_declared","pts_trip","ratio","trip_match","route_id_match","hora"
+        "agency_id", "mean_id", "trip_id", "route_id", "ruta_hex",
+        "pts_en_declared", "pts_trip", "ratio", "trip_match", "route_id_match", "hora",
     ]
     trips[cols_trips].to_parquet(out_trips)
 
-    print(f"✅ Puntos (sin duplicados) → {out_points}")
-    print(f"✅ Resumen de trips      → {out_trips}")
-    print("   Trips incluyen: route_id (declarada), ruta_hex (real dominante), route_id_match, hora, ratio (vs declarada), trip_match (≥ umbral).")
+    print(f"✅ Puntos (match hex) → {out_points}")
+    print(f"✅ Resumen trips (hex) → {out_trips}")
+    print("   ratio = |hex_trip ∩ hex_ruta| / |hex_trip_únicos| ; min_trip_hex =", min_trip_hex,
+          "; trip_match = ratio ≥ umbral AND pts_trip ≥ min_trip_hex")
 
 
 if __name__ == "__main__":
