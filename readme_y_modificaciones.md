@@ -130,3 +130,80 @@ Este proyecto automatiza el control del cumplimiento de rutas de transporte púb
 Permite al Viceministerio de Transporte realizar un monitoreo más preciso, detectar desvíos de operación y mejorar la fiscalización mediante un análisis geoespacial reproducible, dinámico y visualmente interpretativo.
 
 ---
+
+# Modificaciones al Anteproyecto – Cumplimiento de Rutas con H3
+
+## 1. Sustitución de archivos `.shp` por `.csv`
+**Antes:** el diseño original asumía que las rutas oficiales del VMT estaban en formato shapefile.  
+**Ahora:** se confirmó que las rutas se encuentran en archivos `.csv`, con coordenadas de los tramos o puntos de la ruta.  
+**Justificación:** simplifica la lectura y evita dependencias de archivos GIS complejos; permite integración directa con `pandas` y `geopandas`.
+
+---
+
+## 2. Implementación de un pipeline automatizado (`pipeline.py`)
+**Antes:** el flujo de trabajo se ejecutaba por módulos separados (`build_h3.py`, `match_h3.py`, `viz_map.py`).  
+**Ahora:** el archivo `pipeline.py` coordina todas las etapas del procesamiento.  
+**Justificación:** unifica la ejecución y evita errores manuales. El usuario puede optar por:
+- `--mode default`: abrir directamente la visualización si ya existen los datos procesados.  
+- `--mode new`: regenerar todo el proceso desde los datos brutos.
+
+---
+
+## 3. Migración de la visualización a Streamlit + PyDeck
+**Antes:** la visualización se realizaba con Folium y QGIS.  
+**Ahora:** se reemplazó por una interfaz unificada en **Streamlit**, con renderizado WebGL mediante **PyDeck**.  
+**Justificación:**  
+- Mucho mejor rendimiento (puede mostrar cientos de miles de puntos).  
+- Filtros interactivos jerárquicos (empresa → línea → bus → viaje).  
+- Visualización instantánea en navegador, sin necesidad de software GIS externo.
+
+---
+
+## 4. Incorporación de métricas y panel de cumplimiento
+**Antes:** los cálculos de cumplimiento se limitaban a promedios generales.  
+**Ahora:** el sistema calcula KPIs por empresa, línea y bus, y muestra los casos con menor porcentaje de puntos dentro de la ruta.  
+**Justificación:** facilita el análisis de desempeño operativo y la detección rápida de desvíos.
+
+---
+
+## 5. Simplificación de dependencias y flujo de instalación
+**Antes:** se incluía un script `.sh` para Linux/macOS.  
+**Ahora:** todo el flujo se gestiona con `pipeline.py`, eliminando la necesidad de scripts adicionales.  
+**Justificación:** mejora la portabilidad en Windows, que es el entorno principal de ejecución.
+
+---
+
+## 6. Revisión del objetivo técnico
+**Antes:** el objetivo principal era generar una herramienta de validación estática.  
+**Ahora:** se orienta hacia una **plataforma dinámica e interactiva**, capaz de actualizarse periódicamente y servir como módulo de fiscalización del VMT.  
+**Justificación:** la integración de visualización, análisis y KPIs en un solo entorno lo convierte en una herramienta operativa y no solo de investigación.
+
+---
+
+## 7. Estructura final del proyecto
+**Archivos clave:**
+- `src/build_h3.py`: genera celdas H3 por ruta.  
+- `src/match_h3.py`: compara puntos GPS con rutas H3.  
+- `src/app_map.py`: visualización con Streamlit y PyDeck.  
+- `src/pipeline.py`: pipeline completo de generación y ejecución.  
+
+**Datos principales:**
+- `data/raw/`: rutas oficiales y datos GPS (.csv).  
+- `data/processed/`: resultados procesados (.parquet, .csv).  
+
+---
+
+## 8. Impacto de las modificaciones
+Las modificaciones introducidas:
+- Mejoran la velocidad de procesamiento.  
+- Eliminaron dependencias innecesarias (como archivos shapefile o Folium).  
+- Introducen un flujo reproducible, con opciones claras y controladas.  
+- Amplían el alcance del proyecto al permitir un análisis detallado por bus y viaje, visualizable en tiempo real.
+
+---
+
+## 9. Próximos pasos
+- Incorporar filtros por fecha o rango horario en el mapa.  
+- Permitir actualización incremental (solo nuevos GPS).  
+- Conectar los resultados a un panel de reportes automatizado (Power BI o Streamlit Dashboard).
+
