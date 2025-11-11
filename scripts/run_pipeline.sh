@@ -1,5 +1,7 @@
-#!/bin/bash
-# scripts/run_pipeline.sh
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Paso 1: construir geometrías H3 desde las rutas
-python -m src.build_h3
+ROOT="$(cd "$(dirname "$0")/.."; pwd)"
+cd "$ROOT"
+
+python src/pipeline.py --mode "${1:-default}"

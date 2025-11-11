@@ -10,7 +10,7 @@ __pycache__/
 *$py.class
 *.so
 .Python
-build/
+build/ 
 develop-eggs/
 dist/
 downloads/
@@ -37,8 +37,3 @@ wheels/
 .DS_Store
 Thumbs.db
 
-# Data and outputs (optional - ajusta según necesites)
-*.csv
-*.xlsx
-data/raw/*
-!data/raw/.gitkeep
