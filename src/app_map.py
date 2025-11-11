@@ -1,9 +1,9 @@
 # ===============================================================
-# app_map.py — Streamlit + PyDeck
+# app_map.py — Streamlit + PyDeck (todo en uno)
 # Filtros: Empresa → Línea → Bus → Trip
-# Puntos DENTRO (verde) si h3 ∈ hexágonos de rutas activas; FUERA (rojo) si no
-# Rutas H3 planas (polígonos), sin PathLayer
-# Panel "Peor cumplimiento" (empresa, línea, bus) basado en la SELECCIÓN
+# Mapa: Rutas H3 planas + puntos DENTRO (verde) / FUERA (rojo) por H3
+# Peor cumplimiento: % de puntos dentro (sobre la selección)
+# KPIs (trips): usa gps_match_trips.parquet (ratio ≥ 0.60 = OK)
 # ===============================================================
 
 import streamlit as st
@@ -16,13 +16,14 @@ from pathlib import Path
 import h3
 import json, ast
 
-st.set_page_config(layout="wide", page_title="Mapa de rutas y puntos")
+st.set_page_config(layout="wide", page_title="Mapa de rutas y KPIs")
 
 # --------- Paths (ajústalos a tu proyecto) ----------
-PATH_RUTAS_H3 = Path("data/processed/rutas_h3.parquet")          # ruta_hex, h3_list
-PATH_POINTS   = Path("data/processed/gps_match_points.parquet")  # latitude, longitude, h3, agency_id, ruta_hex, mean_id/identificacion, trip_id, fecha_hora
-PATH_EOTS     = Path("data/raw/eots.csv")                        # catálogo empresas
-PATH_RUT_CAT  = Path("data/raw/catalogo_rutas_cid.csv")          # catálogo rutas (ruta_hex, linea, ramal, origen, destino, identificacion)
+PATH_RUTAS_H3 = Path("data/processed/rutas_h3.parquet")           # ruta_hex, h3_list
+PATH_POINTS   = Path("data/processed/gps_match_points.parquet")   # latitude, longitude, h3, agency_id, ruta_hex, mean_id/identificacion, trip_id, fecha_hora
+PATH_TRIPS    = Path("data/processed/gps_match_trips.parquet")    # agency_id, mean_id, trip_id, ruta_hex, ratio, trip_match
+PATH_EOTS     = Path("data/raw/eots.csv")                         # catálogo empresas
+PATH_RUT_CAT  = Path("data/raw/catalogo_rutas_cid.csv")           # catálogo rutas (ruta_hex, linea, ramal, origen, destino, identificacion)
 
 CRS = "EPSG:4326"
 
@@ -211,10 +212,48 @@ def load_points(path: Path, max_points: int,
     keep = [c for c in keep if c in df.columns]
     return df[keep].copy()
 
+# ----------------- Trips (cache) para KPIs -----------------
+@st.cache_data(show_spinner=True)
+def load_trips(path: Path, emp_dict: dict, ruta_dict: dict):
+    df = pd.read_parquet(path)
+
+    # normalizaciones
+    for c in ("agency_id","ruta_hex","mean_id"):
+        if c in df.columns: df[c] = df[c].astype(str).str.strip()
+    if "agency_id" in df.columns:
+        df["agency_id"] = df["agency_id"].apply(norm_emp_id)
+
+    df["ratio"] = pd.to_numeric(df.get("ratio", np.nan), errors="coerce")
+    if "trip_match" not in df.columns or df["trip_match"].isna().all():
+        df["trip_match"] = df["ratio"] >= 0.60
+
+    # mapear nombres de empresa
+    df["empresa_nombre"] = df["agency_id"].map(emp_dict).fillna(df.get("agency_id",""))
+
+    # mapear línea desde ruta_hex si no existe
+    if "linea" not in df.columns:
+        df["linea"] = df.get("ruta_hex","").astype(str).str.upper().map(
+            lambda rh: (ruta_dict.get(rh, {}) or {}).get("linea", str(rh)[:4])
+        )
+
+    # ids string para alinear con filtros
+    if "trip_id" in df.columns:
+        df["trip_id_str"] = df["trip_id"].astype(str)
+    else:
+        df["trip_id_str"] = ""
+
+    # hora si existiera en trips (no es imprescindible)
+    if "hora" in df.columns:
+        df["hora_str"] = df["hora"].apply(lambda x: "" if pd.isna(x) else str(int(x)))
+    else:
+        df["hora_str"] = ""
+
+    return df
+
 # ----------------- Sidebar: carga y parámetros -----------------
 st.sidebar.title("Datos")
 max_points = st.sidebar.number_input(
-    "Máx. puntos a cargar", min_value=10_000, max_value=2_000_000, value=400_000, step=50_000  # <- 400k por defecto
+    "Máx. puntos a cargar", min_value=10_000, max_value=2_000_000, value=400_000, step=50_000  # 400k por defecto
 )
 
 emp_dict  = load_dim_empresas(PATH_EOTS)
@@ -225,8 +264,8 @@ rutas_gdf, hex_by_route = load_rutas(PATH_RUTAS_H3)
 pts = load_points(PATH_POINTS, max_points, emp_dict, ruta_dict)
 st.success(f"Datos cargados: {len(pts):,} puntos | {len(rutas_gdf):,} celdas H3")
 
-# ----------------- Filtros en cascada: Empresa → Línea → Bus → Trip -----------------
-st.sidebar.header("Filtros (en cascada)")
+# ----------------- Filtros en cascada (Empresa → Línea → Bus → Trip) -----------------
+st.sidebar.header("Filtros")
 
 def _opts(df, col, all_label="(todas)"):
     if col not in df.columns: return [all_label]
@@ -254,7 +293,7 @@ lin_opts = _opts(df1, "linea", "(todas)")
 lin_sel  = st.sidebar.selectbox("Línea", lin_opts, index=_index_or_zero(st.session_state.get("f_lin","(todas)"), lin_opts), key="f_lin")
 df2 = df1 if lin_sel == "(todas)" else df1[df1["linea"] == lin_sel]
 
-# 3) Bus (identificacion)
+# 3) Bus (identificación)
 bus_opts = _opts_any(df2, "identificacion", "(todos)")
 bus_sel  = st.sidebar.selectbox("Bus (identificación)", bus_opts, index=_index_or_zero(st.session_state.get("f_bus","(todos)"), bus_opts), key="f_bus")
 df3 = df2 if bus_sel == "(todos)" else df2[df2["identificacion"] == bus_sel]
@@ -264,26 +303,22 @@ trip_opts = _opts_any(df3, "trip_id_str", "(todos)")
 trip_sel  = st.sidebar.selectbox("Trip", trip_opts, index=_index_or_zero(st.session_state.get("f_trip","(todos)"), trip_opts), key="f_trip")
 sel_pts   = df3 if trip_sel == "(todos)" else df3[df3["trip_id_str"] == trip_sel]
 
-# ----------------- DENTRO/FUERA por H3 -----------------
-# Rutas activas según puntos visibles (ruta_hex)
+# ----------------- DENTRO/FUERA por H3 en la selección -----------------
 if "ruta_hex" in sel_pts.columns and len(sel_pts):
     routes_active = sorted(sel_pts["ruta_hex"].dropna().astype(str).str.upper().unique())
 else:
     routes_active = []
 
-# Unión de hex de rutas activas; si no hay, usa todas
 if routes_active:
     hex_union = set().union(*[hex_by_route.get(r, set()) for r in routes_active])
 else:
     hex_union = set().union(*hex_by_route.values()) if hex_by_route else set()
 
-# _in por H3 en la SELECCIÓN
 if len(sel_pts) and "h3" in sel_pts.columns and len(hex_union) > 0:
     _in_mask = sel_pts["h3"].isin(hex_union).values
 else:
     _in_mask = np.zeros(len(sel_pts), dtype=bool)
 
-# Colores RGBA
 colors = np.tile([217, 95, 2, 220], (len(sel_pts), 1))   # rojo
 if len(sel_pts):
     colors[_in_mask] = [0, 158, 115, 220]                # verde
@@ -292,8 +327,9 @@ sel_pts["_in"] = _in_mask
 sel_pts["_color_rgba"] = colors.tolist()
 
 # ----------------- Tabs -----------------
-tab_map, tab_worst = st.tabs(["Mapa", "Peor cumplimiento"])
+tab_map, tab_worst, tab_kpi = st.tabs(["Mapa", "Peor cumplimiento", "KPIs (trips)"])
 
+# ===================== MAPA =====================
 with tab_map:
     st.sidebar.markdown("---")
     st.sidebar.subheader("Capas y estilo")
@@ -306,7 +342,6 @@ with tab_map:
     point_radius     = st.sidebar.slider("Radio del punto (px)", 1, 20, 4)
     line_width       = st.sidebar.slider("Grosor borde rutas (px)", 1, 10, 3)
 
-    # Centro del mapa
     center_lat, center_lon = -25.3, -57.6
     if not sel_pts.empty:
         center_lat = float(sel_pts["latitude"].mean())
@@ -348,7 +383,6 @@ with tab_map:
                 recs[c] = recs[c].astype(str)
         return recs.to_dict("records")
 
-    # Puntos DENTRO (verde)
     if show_points_in:
         data_in = make_point_records(sel_pts[sel_pts["_in"]])
         if data_in:
@@ -363,7 +397,6 @@ with tab_map:
                 )
             )
 
-    # Puntos FUERA (rojo)
     if show_points_out:
         data_out = make_point_records(sel_pts[~sel_pts["_in"]])
         if data_out:
@@ -394,13 +427,12 @@ with tab_map:
         f"""
 **Puntos mostrados:** {len(sel_pts):,}  
 **Trips únicos (vista):** {n_trips:,}  
-**% puntos DENTRO (por H3):** {pct_in:.1f}%
-"""
+**% puntos DENTRO (por H3):** {pct_in:.1f}%"""
     )
 
-# ----------------- Peor cumplimiento (sobre la SELECCIÓN) -----------------
+# ===================== PEOR CUMPLIMIENTO (puntos) =====================
 with tab_worst:
-    st.subheader("Identificadores con menor cumplimiento (puntos dentro / total) — según selección actual")
+    st.subheader("Identificadores con menor % de puntos dentro — según selección actual")
     if sel_pts.empty or "_in" not in sel_pts.columns:
         st.info("No hay puntos en la selección actual.")
     else:
@@ -421,25 +453,99 @@ with tab_worst:
             agg["pct_dentro"] = (agg["pts_dentro"] / agg["pts_total"]).astype(float)
             return agg.sort_values("pct_dentro", ascending=True)
 
-        # 1) Empresas
-        worst_emp = compliance_table(sel_pts, ["empresa_nombre"]).head(int(top_k))
-        # 2) Rutas (línea)
+        worst_emp   = compliance_table(sel_pts, ["empresa_nombre"]).head(int(top_k))
         worst_linea = compliance_table(sel_pts, ["empresa_nombre","linea"]).head(int(top_k))
-        # 3) Buses (identificación)
-        worst_bus = compliance_table(sel_pts, ["empresa_nombre","linea","identificacion"]).head(int(top_k))
+        worst_bus   = compliance_table(sel_pts, ["empresa_nombre","linea","identificacion"]).head(int(top_k))
 
         c1, c2, c3 = st.columns(3)
         with c1:
-            st.markdown("**Empresas (peor % dentro)**")
+            st.markdown("**Empresas**")
             st.dataframe(worst_emp, use_container_width=True)
         with c2:
-            st.markdown("**Rutas / Línea (peor % dentro)**")
+            st.markdown("**Rutas / Línea**")
             st.dataframe(worst_linea, use_container_width=True)
         with c3:
-            st.markdown("**Buses (peor % dentro)**")
+            st.markdown("**Buses**")
             st.dataframe(worst_bus, use_container_width=True)
 
-        # Descargas
         st.download_button("Descargar empresas (CSV)", worst_emp.to_csv(index=False).encode("utf-8"), file_name="worst_empresas.csv")
-        st.download_button("Descargar líneas (CSV)", worst_linea.to_csv(index=False).encode("utf-8"), file_name="worst_lineas.csv")
-        st.download_button("Descargar buses (CSV)", worst_bus.to_csv(index=False).encode("utf-8"), file_name="worst_buses.csv")
+        st.download_button("Descargar líneas (CSV)",  worst_linea.to_csv(index=False).encode("utf-8"), file_name="worst_lineas.csv")
+        st.download_button("Descargar buses (CSV)",   worst_bus.to_csv(index=False).encode("utf-8"), file_name="worst_buses.csv")
+
+# ===================== KPIs (TRIPS) =====================
+with tab_kpi:
+    st.subheader("KPIs por viaje (usa gps_match_trips.parquet; OK si ratio ≥ 0.60)")
+    try:
+        trips = load_trips(PATH_TRIPS, emp_dict, ruta_dict)
+    except Exception as e:
+        st.warning(f"No se pudo leer {PATH_TRIPS}: {e}")
+        st.stop()
+
+    # Alinear con filtros de la vista actual
+    dfk = trips.copy()
+
+    # Filtrar por empresa (usa nombre mapeado)
+    if emp_sel != "(todas)":
+        dfk = dfk[dfk["empresa_nombre"] == emp_sel]
+
+    # Filtrar por línea (si existe)
+    if lin_sel != "(todas)" and "linea" in dfk.columns:
+        dfk = dfk[dfk["linea"] == lin_sel]
+
+    # Filtrar por bus (identificación). Si tu identificación ≈ mean_id, ajusta según tus datos de trips.
+    # Aquí intentamos usar 'identificacion' si está en trips; si no, usamos mean_id como proxy.
+    if bus_sel != "(todos)":
+        if "identificacion" in dfk.columns:
+            dfk = dfk[dfk["identificacion"] == bus_sel]
+        else:
+            dfk = dfk[dfk["mean_id"] == bus_sel]
+
+    # Filtrar por trip
+    if trip_sel != "(todos)":
+        dfk = dfk[dfk["trip_id_str"] == trip_sel]
+
+    if dfk.empty:
+        st.info("Sin viajes para la selección.")
+    else:
+        k = st.number_input("Top N por menor % OK", 1, 100, 10)
+
+        def agg(gcols):
+            tmp = (dfk
+                   .groupby(gcols, dropna=False)["trip_match"]
+                   .agg(total_trips="count", trips_ok="sum")
+                   .reset_index())
+            tmp["pct_ok"] = tmp["trips_ok"]/tmp["total_trips"]
+            return tmp.sort_values("pct_ok").head(int(k))
+
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            st.markdown("**Empresas (trips)**")
+            emp_tbl = agg(["empresa_nombre"])
+            st.dataframe(emp_tbl, use_container_width=True)
+
+        with c2:
+            st.markdown("**Empresa + Línea (trips)**")
+            cols = ["empresa_nombre","linea"] if "linea" in dfk.columns else ["empresa_nombre","ruta_hex"]
+            lin_tbl = agg(cols)
+            st.dataframe(lin_tbl, use_container_width=True)
+
+        with c3:
+            st.markdown("**Empresa + Línea + Bus (trips)**")
+            if "linea" in dfk.columns:
+                cols = ["empresa_nombre","linea","mean_id"]
+            else:
+                cols = ["empresa_nombre","ruta_hex","mean_id"]
+            bus_tbl = agg(cols)
+            st.dataframe(bus_tbl, use_container_width=True)
+
+        st.markdown("---")
+        st.markdown("**Detalle de viajes (selección actual)**")
+        cols_show = [c for c in ["empresa_nombre","linea","mean_id","trip_id_str","ruta_hex","ratio","trip_match"] if c in dfk.columns]
+        st.dataframe(dfk[cols_show].sort_values(["empresa_nombre","linea","mean_id","trip_id_str"]), use_container_width=True)
+
+        # Descargas
+        st.download_button("Descargar resumen empresas (CSV)", emp_tbl.to_csv(index=False).encode("utf-8"), file_name="kpi_empresas_trips.csv")
+        st.download_button("Descargar resumen líneas (CSV)",   lin_tbl.to_csv(index=False).encode("utf-8"), file_name="kpi_lineas_trips.csv")
+        st.download_button("Descargar resumen buses (CSV)",    bus_tbl.to_csv(index=False).encode("utf-8"), file_name="kpi_buses_trips.csv")
+        st.download_button("Descargar detalle (CSV)",          dfk[cols_show].to_csv(index=False).encode("utf-8"), file_name="kpi_trips_detalle.csv")
