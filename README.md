@@ -60,14 +60,13 @@ cumplimiento-rutas-h3/
 ├─ data/
 │  ├─ raw/               # Archivos de entrada (rutas oficiales y puntos GPS)
 │  └─ processed/         # Resultados procesados (Parquet, CSV)
-├─ src/
-│  ├─ build_h3.py        # Conversión de rutas oficiales CSV → hexágonos H3
-│  ├─ match_h3.py        # Verificación de cumplimiento GPS vs H3
-│  ├─ app_map.py         # Interfaz Streamlit con mapa interactivo y KPIs
-│  ├─ pipeline.py        # Flujo principal de ejecución (pipeline)
-│  └─ config.py          # Carga de configuración general
-└─ scripts/
-   └─ run_pipeline.sh    # (Opcional, solo para entornos Unix)
+└─ src/
+   ├─ build_h3.py        # Conversión de rutas oficiales CSV → hexágonos H3
+   ├─ match_h3.py        # Verificación de cumplimiento GPS vs H3
+   ├─ app_map.py         # Interfaz Streamlit con mapa interactivo y KPIs
+   ├─ pipeline.py        # Flujo principal de ejecución (pipeline)
+   └─ config.py          # Carga de configuración general
+
 ```
 
 ---
