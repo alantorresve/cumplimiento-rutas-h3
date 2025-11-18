@@ -1,9 +1,10 @@
 # ===============================================================
 # app_map.py — Streamlit + PyDeck (todo en uno)
-# Filtros: Empresa → Línea → Bus → Trip
+# Filtros: Empresa → Línea → Bus (mean_id) → Trip
 # Mapa: Rutas H3 planas + puntos DENTRO (verde) / FUERA (rojo) por H3
 # Peor cumplimiento: % de puntos dentro (sobre la selección)
-# KPIs (trips): usa gps_match_trips.parquet (ratio ≥ 0.60 = OK)
+# KPIs (trips): usa gps_match_trips.parquet (ratio ≥ 0.60 = OK) — sin export PNG
+# Export PNG (mapa): auto-ajustado (sin bordes), con ejes y encabezado (filtros + KPI)
 # ===============================================================
 
 import streamlit as st
@@ -13,58 +14,195 @@ import geopandas as gpd
 import pydeck as pdk
 from shapely.geometry import Polygon
 from pathlib import Path
+from io import BytesIO
 import h3
 import json, ast
 
 st.set_page_config(layout="wide", page_title="Mapa de rutas y KPIs")
 
-# --------- Paths (ajústalos a tu proyecto) ----------
-PATH_RUTAS_H3 = Path("data/processed/rutas_h3.parquet")           # ruta_hex, h3_list
-PATH_POINTS   = Path("data/processed/gps_match_points.parquet")   # latitude, longitude, h3, agency_id, ruta_hex, mean_id/identificacion, trip_id, fecha_hora
-PATH_TRIPS    = Path("data/processed/gps_match_trips.parquet")    # agency_id, mean_id, trip_id, ruta_hex, ratio, trip_match
-PATH_EOTS     = Path("data/raw/eots.csv")                         # catálogo empresas
-PATH_RUT_CAT  = Path("data/raw/catalogo_rutas_cid.csv")           # catálogo rutas (ruta_hex, linea, ramal, origen, destino, identificacion)
-
+# --------- Paths ----------
+PATH_RUTAS_H3 = Path("data/processed/rutas_h3.parquet")
+PATH_POINTS   = Path("data/processed/gps_match_points.parquet")
+PATH_TRIPS    = Path("data/processed/gps_match_trips.parquet")
+PATH_EOTS     = Path("data/raw/eots.csv")
+PATH_RUT_CAT  = Path("data/raw/catalogo_rutas_cid.csv")
 CRS = "EPSG:4326"
 
 # ----------------- Helpers -----------------
 def parse_h3_list(val):
     if isinstance(val, (list, tuple, set, np.ndarray, pd.Series)):
         return list(val)
-    if val is None or (isinstance(val, float) and np.isnan(val)):
-        return []
+    if val is None or (isinstance(val, float) and np.isnan(val)): return []
     s = str(val).strip()
-    if not s or s.lower() in {"nan", "none", "null"}:
-        return []
-    try:
-        x = json.loads(s);  return list(x) if isinstance(x, (list, tuple, set)) else [s]
-    except Exception:
-        pass
-    try:
-        x = ast.literal_eval(s);  return list(x) if isinstance(x, (list, tuple, set)) else [s]
-    except Exception:
-        pass
+    if not s or s.lower() in {"nan", "none", "null"}: return []
+    for loader in (lambda x: json.loads(x), lambda x: ast.literal_eval(x)):
+        try:
+            x = loader(s)
+            return list(x) if isinstance(x, (list, tuple, set)) else [s]
+        except Exception:
+            pass
     return [s]
 
 def boundary_to_polygon(hcell: str) -> Polygon:
-    if hasattr(h3, "h3_to_geo_boundary"):          # v3
+    if hasattr(h3, "h3_to_geo_boundary"):
         coords = h3.h3_to_geo_boundary(hcell, geo_json=True)
-    elif hasattr(h3, "cell_to_boundary"):          # v4
+    elif hasattr(h3, "cell_to_boundary"):
         coords = h3.cell_to_boundary(hcell)
     else:
-        raise RuntimeError("Librería h3 no tiene funciones de boundary.")
+        raise RuntimeError("Librería h3 sin funciones de boundary.")
     ring = [(lng, lat) for lat, lng in coords]
     return Polygon(ring)
 
 def polygon_to_coords_list(poly: Polygon):
-    if poly is None or poly.is_empty:
-        return []
+    if poly is None or poly.is_empty: return []
     return [[float(x), float(y)] for x, y in poly.exterior.coords]
 
 def norm_emp_id(x):
     if pd.isna(x): return x
     s = str(x).strip()
     return s.zfill(4) if s.isdigit() and len(s) <= 4 else s
+
+# ================= util export: MAP PNG (AUTO) =================
+def export_map_png(rutas_gdf, sel_pts, routes_active,
+                   empresa=None, linea=None, bus=None, trip=None,
+                   max_side_px=3000, dpi=300):
+    """
+    Exporta PNG auto-ajustado sin bordes, con ejes visibles y
+    encabezado superpuesto (filtros + KPI). Usa contextily si está disponible.
+    El lado mayor se limita a max_side_px a 'dpi' especificados.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+    try:
+        import contextily as cx
+        has_cx = True
+    except Exception:
+        has_cx = False
+
+    # GDF de puntos dentro/fuera en WGS84
+    gdf_in  = gpd.GeoDataFrame(
+        sel_pts[sel_pts["_in"]].copy(),
+        geometry=gpd.points_from_xy(
+            sel_pts.loc[sel_pts["_in"], "longitude"].astype(float),
+            sel_pts.loc[sel_pts["_in"], "latitude"].astype(float)
+        ),
+        crs="EPSG:4326"
+    )
+    gdf_out = gpd.GeoDataFrame(
+        sel_pts[~sel_pts["_in"]].copy(),
+        geometry=gpd.points_from_xy(
+            sel_pts.loc[~sel_pts["_in"], "longitude"].astype(float),
+            sel_pts.loc[~sel_pts["_in"], "latitude"].astype(float)
+        ),
+        crs="EPSG:4326"
+    )
+
+    rutas_plot = rutas_gdf
+    if routes_active:
+        rutas_plot = rutas_gdf[rutas_gdf["ruta_hex"].isin(routes_active)]
+
+    # Elegir CRS de trabajo para export: 3857 si hay contextily, sino 4326
+    target_crs = "EPSG:3857" if has_cx else "EPSG:4326"
+    for g in [rutas_plot, gdf_in, gdf_out]:
+        if g is not None and not g.empty and g.crs != target_crs:
+            g.to_crs(target_crs, inplace=True)
+
+    # Extent global
+    all_bounds = []
+    for g in [rutas_plot, gdf_in, gdf_out]:
+        if g is not None and not g.empty:
+            all_bounds.append(g.total_bounds)  # minx, miny, maxx, maxy
+    if all_bounds:
+        b = np.array(all_bounds)
+        minx, miny = np.min(b[:,0]), np.min(b[:,1])
+        maxx, maxy = np.max(b[:,2]), np.max(b[:,3])
+        # margen 8%
+        mx, my = (maxx-minx)*0.08, (maxy-miny)*0.08
+        minx, maxx = minx-mx, maxx+mx
+        miny, maxy = miny-my, maxy+my
+    else:
+        # Extensión por defecto (AMA aprox. en EPSG:4326); se transforma si hace falta
+        fallback = gpd.GeoDataFrame(geometry=[Polygon([(-57.75,-25.45),(-57.45,-25.45),(-57.45,-25.2),(-57.75,-25.2)])], crs="EPSG:4326")
+        if target_crs != "EPSG:4326":
+            fallback = fallback.to_crs(target_crs)
+        minx, miny, maxx, maxy = fallback.total_bounds
+
+    # Tamaño de figura auto según aspecto del extent
+    width_units  = maxx - minx
+    height_units = maxy - miny
+    aspect = width_units / max(height_units, 1e-9)
+    if aspect >= 1.0:
+        width_px  = max_side_px
+        height_px = int(round(width_px / max(aspect, 1e-9)))
+    else:
+        height_px = max_side_px
+        width_px  = int(round(height_px * aspect))
+
+    fig_w = width_px / dpi
+    fig_h = height_px / dpi
+
+    # Crear figura sin bordes
+    import matplotlib as mpl
+    mpl.rcParams['axes.linewidth'] = 0.6
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
+    fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
+
+    # Basemap si hay contextily
+    ax.set_xlim(minx, maxx)
+    ax.set_ylim(miny, maxy)
+    if has_cx:
+        try:
+            cx.add_basemap(ax, source=cx.providers.CartoDB.PositronNoLabels, crs=target_crs, attribution_size=5)
+        except Exception:
+            pass
+
+    # Rutas planas
+    if rutas_plot is not None and not rutas_plot.empty:
+        rutas_plot.boundary.plot(ax=ax, color=(0.6,0.6,0.6,0.9), linewidth=0.5)
+        rutas_plot.plot(ax=ax, facecolor=(0.8,0.8,0.8,0.15), edgecolor=(0.6,0.6,0.6,0.6), linewidth=0.3)
+
+    # Puntos
+    if gdf_out is not None and len(gdf_out):
+        gdf_out.plot(ax=ax, markersize=1.2, color=(217/255,95/255,2/255,0.9))
+    if gdf_in is not None and len(gdf_in):
+        gdf_in.plot(ax=ax, markersize=1.2, color=(0/255,158/255,115/255,0.9))
+
+    # Ejes + grilla
+    ax.grid(True, color=(0,0,0,0.08), linewidth=0.4)
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_linewidth(0.6)
+        spine.set_color((0,0,0,0.5))
+    ax.tick_params(axis='both', which='both', labelsize=6, colors=(0,0,0,0.6), length=2)
+
+    # Leyenda
+    patches = [
+        Patch(color=(0/255,158/255,115/255,0.9), label='Dentro'),
+        Patch(color=(217/255,95/255,2/255,0.9), label='Fuera')
+    ]
+    leg = ax.legend(handles=patches, loc='lower left', frameon=False, fontsize=7)
+    if leg:
+        for txt in leg.get_texts():
+            txt.set_color((0,0,0,0.8))
+
+    # Encabezado con filtros + KPI
+    empresa = empresa or "(todas)"
+    linea   = linea   or "(todas)"
+    bus     = bus     or "(todos)"
+    trip    = trip    or "(todos)"
+    pct_in  = (sel_pts["_in"].sum() / len(sel_pts) * 100) if len(sel_pts) else 0.0
+    header  = (f"Empresa: {empresa} | Línea: {linea} | Bus (mean_id): {bus} | Trip: {trip}\n"
+               f"Puntos: {len(sel_pts):,}  •  % Dentro (H3): {pct_in:.1f}%")
+    ax.text(0.01, 0.99, header,
+            transform=ax.transAxes, ha='left', va='top',
+            fontsize=8, color=(0,0,0,0.9),
+            bbox=dict(facecolor=(1,1,1,0.75), edgecolor='none', pad=4))
+
+    buf = BytesIO()
+    plt.savefig(buf, format="png", dpi=dpi, bbox_inches="tight", pad_inches=0)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
 
 # ----------------- Diccionarios (cache) -----------------
 @st.cache_data(show_spinner=False)
@@ -89,12 +227,10 @@ def load_dim_rutas(path_cat: Path):
     except UnicodeDecodeError:
         cat = pd.read_csv(path_cat, dtype=str, encoding="latin-1")
     cat.columns = [c.strip().lower() for c in cat.columns]
-    if "ruta_hex" not in cat.columns:
-        return {}
+    if "ruta_hex" not in cat.columns: return {}
     cat["ruta_hex"] = cat["ruta_hex"].astype(str).str.upper().str.strip()
     for c in ["linea","ramal","origen","destino","identificacion"]:
-        if c not in cat.columns:
-            cat[c] = pd.NA
+        if c not in cat.columns: cat[c] = pd.NA
     return cat.set_index("ruta_hex")[["linea","ramal","origen","destino","identificacion"]].to_dict(orient="index")
 
 # ----------------- Rutas H3 (cache) -----------------
@@ -141,8 +277,7 @@ def load_points(path: Path, max_points: int,
     if "ruta_hex" in df.columns:
         df["ruta_hex"] = df["ruta_hex"].astype(str).str.upper().str.strip()
     for c in ("empresa_nombre","linea","ramal","origen","destino","identificacion","mean_id","trip_id","h3"):
-        if c in df.columns:
-            df[c] = df[c].astype(str)
+        if c in df.columns: df[c] = df[c].astype(str)
 
     # hora
     if "fecha_hora" in df.columns:
@@ -164,7 +299,7 @@ def load_points(path: Path, max_points: int,
     if len(df) > max_points:
         df = df.sample(n=int(max_points), random_state=42)
 
-    # Diccionario empresas
+    # Empresas (nombre)
     if "empresa_nombre" not in df.columns or df["empresa_nombre"].isna().all():
         df["empresa_nombre"] = df.get("agency_id", pd.Series([""]*len(df)))
     df["empresa_nombre"] = df.apply(
@@ -172,10 +307,9 @@ def load_points(path: Path, max_points: int,
         axis=1
     )
 
-    # Diccionario rutas → relleno de linea/ramal/origen/destino/identificacion
+    # Rutas → completa campos si faltan
     for c in ["linea","ramal","origen","destino","identificacion"]:
-        if c not in df.columns:
-            df[c] = pd.NA
+        if c not in df.columns: df[c] = pd.NA
 
     def fill_from_route(row, key):
         rh = row.get("ruta_hex", None)
@@ -191,7 +325,9 @@ def load_points(path: Path, max_points: int,
     # fallbacks
     df["linea"] = df["linea"].fillna(df.get("ruta_hex", pd.Series(["0000"]*len(df)))).astype(str).str[:4]
     df["ramal"] = df["ramal"].fillna("—").astype(str)
-    df["identificacion"] = df["identificacion"].fillna(df.get("mean_id","—")).astype(str)
+    if "mean_id" not in df.columns:
+        df["mean_id"] = df.get("identificacion", "—")
+    df["mean_id"] = df["mean_id"].fillna("—").astype(str)
 
     # serializables
     if "trip_id" in df.columns:
@@ -206,54 +342,42 @@ def load_points(path: Path, max_points: int,
 
     keep = [
         "longitude","latitude","h3",
-        "empresa_nombre","linea","ramal","identificacion",
+        "empresa_nombre","linea","ramal","mean_id",
         "trip_id_str","hora_str","fecha_hora_str","ruta_hex"
     ]
     keep = [c for c in keep if c in df.columns]
     return df[keep].copy()
 
-# ----------------- Trips (cache) para KPIs -----------------
+# ----------------- Trips (cache) -----------------
 @st.cache_data(show_spinner=True)
 def load_trips(path: Path, emp_dict: dict, ruta_dict: dict):
     df = pd.read_parquet(path)
-
-    # normalizaciones
     for c in ("agency_id","ruta_hex","mean_id"):
         if c in df.columns: df[c] = df[c].astype(str).str.strip()
     if "agency_id" in df.columns:
         df["agency_id"] = df["agency_id"].apply(norm_emp_id)
-
     df["ratio"] = pd.to_numeric(df.get("ratio", np.nan), errors="coerce")
     if "trip_match" not in df.columns or df["trip_match"].isna().all():
         df["trip_match"] = df["ratio"] >= 0.60
-
-    # mapear nombres de empresa
     df["empresa_nombre"] = df["agency_id"].map(emp_dict).fillna(df.get("agency_id",""))
-
-    # mapear línea desde ruta_hex si no existe
     if "linea" not in df.columns:
         df["linea"] = df.get("ruta_hex","").astype(str).str.upper().map(
             lambda rh: (ruta_dict.get(rh, {}) or {}).get("linea", str(rh)[:4])
         )
-
-    # ids string para alinear con filtros
     if "trip_id" in df.columns:
         df["trip_id_str"] = df["trip_id"].astype(str)
     else:
         df["trip_id_str"] = ""
-
-    # hora si existiera en trips (no es imprescindible)
     if "hora" in df.columns:
         df["hora_str"] = df["hora"].apply(lambda x: "" if pd.isna(x) else str(int(x)))
     else:
         df["hora_str"] = ""
-
     return df
 
 # ----------------- Sidebar: carga y parámetros -----------------
 st.sidebar.title("Datos")
 max_points = st.sidebar.number_input(
-    "Máx. puntos a cargar", min_value=10_000, max_value=2_000_000, value=400_000, step=50_000  # 400k por defecto
+    "Máx. puntos a cargar", min_value=10_000, max_value=2_000_000, value=400_000, step=50_000
 )
 
 emp_dict  = load_dim_empresas(PATH_EOTS)
@@ -264,7 +388,7 @@ rutas_gdf, hex_by_route = load_rutas(PATH_RUTAS_H3)
 pts = load_points(PATH_POINTS, max_points, emp_dict, ruta_dict)
 st.success(f"Datos cargados: {len(pts):,} puntos | {len(rutas_gdf):,} celdas H3")
 
-# ----------------- Filtros en cascada (Empresa → Línea → Bus → Trip) -----------------
+# ----------------- Filtros en cascada -----------------
 st.sidebar.header("Filtros")
 
 def _opts(df, col, all_label="(todas)"):
@@ -278,10 +402,8 @@ def _opts_any(df, col, all_label="(todos)"):
     return [all_label] + vals
 
 def _index_or_zero(curr, opts):
-    try:
-        return opts.index(curr) if curr in opts else 0
-    except Exception:
-        return 0
+    try: return opts.index(curr) if curr in opts else 0
+    except Exception: return 0
 
 # 1) Empresa
 emp_opts = _opts(pts, "empresa_nombre", "(todas)")
@@ -293,17 +415,17 @@ lin_opts = _opts(df1, "linea", "(todas)")
 lin_sel  = st.sidebar.selectbox("Línea", lin_opts, index=_index_or_zero(st.session_state.get("f_lin","(todas)"), lin_opts), key="f_lin")
 df2 = df1 if lin_sel == "(todas)" else df1[df1["linea"] == lin_sel]
 
-# 3) Bus (identificación)
-bus_opts = _opts_any(df2, "identificacion", "(todos)")
-bus_sel  = st.sidebar.selectbox("Bus (identificación)", bus_opts, index=_index_or_zero(st.session_state.get("f_bus","(todos)"), bus_opts), key="f_bus")
-df3 = df2 if bus_sel == "(todos)" else df2[df2["identificacion"] == bus_sel]
+# 3) Bus (mean_id)
+bus_opts = _opts_any(df2, "mean_id", "(todos)")
+bus_sel  = st.sidebar.selectbox("Bus (mean_id)", bus_opts, index=_index_or_zero(st.session_state.get("f_bus","(todos)"), bus_opts), key="f_bus")
+df3 = df2 if bus_sel == "(todos)" else df2[df2["mean_id"] == bus_sel]
 
 # 4) Trip
 trip_opts = _opts_any(df3, "trip_id_str", "(todos)")
 trip_sel  = st.sidebar.selectbox("Trip", trip_opts, index=_index_or_zero(st.session_state.get("f_trip","(todos)"), trip_opts), key="f_trip")
 sel_pts   = df3 if trip_sel == "(todos)" else df3[df3["trip_id_str"] == trip_sel]
 
-# ----------------- DENTRO/FUERA por H3 en la selección -----------------
+# ----------------- DENTRO/FUERA por H3 -----------------
 if "ruta_hex" in sel_pts.columns and len(sel_pts):
     routes_active = sorted(sel_pts["ruta_hex"].dropna().astype(str).str.upper().unique())
 else:
@@ -319,9 +441,9 @@ if len(sel_pts) and "h3" in sel_pts.columns and len(hex_union) > 0:
 else:
     _in_mask = np.zeros(len(sel_pts), dtype=bool)
 
-colors = np.tile([217, 95, 2, 220], (len(sel_pts), 1))   # rojo
+colors = np.tile([217, 95, 2, 220], (len(sel_pts), 1))
 if len(sel_pts):
-    colors[_in_mask] = [0, 158, 115, 220]                # verde
+    colors[_in_mask] = [0, 158, 115, 220]
 sel_pts = sel_pts.copy()
 sel_pts["_in"] = _in_mask
 sel_pts["_color_rgba"] = colors.tolist()
@@ -349,7 +471,6 @@ with tab_map:
 
     layers = []
 
-    # Rutas H3 planas
     rutas_plot = rutas_gdf
     if only_selected_routes and routes_active:
         rutas_plot = rutas_gdf[rutas_gdf["ruta_hex"].isin(routes_active)]
@@ -372,15 +493,14 @@ with tab_map:
     def make_point_records(df_in: pd.DataFrame):
         if df_in.empty: return []
         cols = ["longitude","latitude","_color_rgba",
-                "empresa_nombre","linea","ramal","identificacion",
+                "empresa_nombre","linea","ramal","mean_id",
                 "trip_id_str","hora_str","fecha_hora_str"]
         cols = [c for c in cols if c in df_in.columns]
         recs = df_in[cols].copy()
         recs["longitude"] = recs["longitude"].astype(float)
         recs["latitude"]  = recs["latitude"].astype(float)
-        for c in ("empresa_nombre","linea","ramal","identificacion","trip_id_str","hora_str","fecha_hora_str"):
-            if c in recs.columns:
-                recs[c] = recs[c].astype(str)
+        for c in ("empresa_nombre","linea","ramal","mean_id","trip_id_str","hora_str","fecha_hora_str"):
+            if c in recs.columns: recs[c] = recs[c].astype(str)
         return recs.to_dict("records")
 
     if show_points_in:
@@ -417,7 +537,7 @@ with tab_map:
         map_style="light",
         initial_view_state=view_state,
         layers=layers,
-        tooltip={"text": "{empresa_nombre}\nLínea: {linea}\nBus: {identificacion}\nTrip: {trip_id_str}\nHora: {hora_str}"},
+        tooltip={"text": "{empresa_nombre}\nLínea: {linea}\nBus (mean_id): {mean_id}\nTrip: {trip_id_str}\nHora: {hora_str}"},
     )
     st.pydeck_chart(deck, use_container_width=True)
 
@@ -429,6 +549,25 @@ with tab_map:
 **Trips únicos (vista):** {n_trips:,}  
 **% puntos DENTRO (por H3):** {pct_in:.1f}%"""
     )
+
+    st.markdown("---")
+    st.subheader("Exportar imagen PNG del mapa (auto)")
+    if st.button("Generar PNG (auto)"):
+        try:
+            buf = export_map_png(
+                rutas_gdf, sel_pts, routes_active,
+                empresa=emp_sel, linea=lin_sel, bus=bus_sel, trip=trip_sel,
+                max_side_px=3000, dpi=300
+            )
+            st.download_button(
+                "Descargar mapa (PNG)",
+                data=buf,
+                file_name="mapa_seleccion.png",
+                mime="image/png"
+            )
+            st.success("PNG generado.")
+        except Exception as e:
+            st.error(f"No se pudo exportar PNG: {e}")
 
 # ===================== PEOR CUMPLIMIENTO (puntos) =====================
 with tab_worst:
@@ -455,7 +594,7 @@ with tab_worst:
 
         worst_emp   = compliance_table(sel_pts, ["empresa_nombre"]).head(int(top_k))
         worst_linea = compliance_table(sel_pts, ["empresa_nombre","linea"]).head(int(top_k))
-        worst_bus   = compliance_table(sel_pts, ["empresa_nombre","linea","identificacion"]).head(int(top_k))
+        worst_bus   = compliance_table(sel_pts, ["empresa_nombre","linea","mean_id"]).head(int(top_k))
 
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -465,7 +604,7 @@ with tab_worst:
             st.markdown("**Rutas / Línea**")
             st.dataframe(worst_linea, use_container_width=True)
         with c3:
-            st.markdown("**Buses**")
+            st.markdown("**Buses (mean_id)**")
             st.dataframe(worst_bus, use_container_width=True)
 
         st.download_button("Descargar empresas (CSV)", worst_emp.to_csv(index=False).encode("utf-8"), file_name="worst_empresas.csv")
@@ -481,26 +620,17 @@ with tab_kpi:
         st.warning(f"No se pudo leer {PATH_TRIPS}: {e}")
         st.stop()
 
-    # Alinear con filtros de la vista actual
     dfk = trips.copy()
 
-    # Filtrar por empresa (usa nombre mapeado)
+    # Alinear con filtros de la vista actual
     if emp_sel != "(todas)":
         dfk = dfk[dfk["empresa_nombre"] == emp_sel]
-
-    # Filtrar por línea (si existe)
     if lin_sel != "(todas)" and "linea" in dfk.columns:
         dfk = dfk[dfk["linea"] == lin_sel]
-
-    # Filtrar por bus (identificación). Si tu identificación ≈ mean_id, ajusta según tus datos de trips.
-    # Aquí intentamos usar 'identificacion' si está en trips; si no, usamos mean_id como proxy.
     if bus_sel != "(todos)":
-        if "identificacion" in dfk.columns:
-            dfk = dfk[dfk["identificacion"] == bus_sel]
-        else:
+        # 'mean_id' es el id de bus en trips
+        if "mean_id" in dfk.columns:
             dfk = dfk[dfk["mean_id"] == bus_sel]
-
-    # Filtrar por trip
     if trip_sel != "(todos)":
         dfk = dfk[dfk["trip_id_str"] == trip_sel]
 
