@@ -36,7 +36,7 @@ except ImportError:
 
 
 # =====================================================
-# 🔐 WKB HEX → Shapely (seguro)
+#  WKB HEX → Shapely 
 # =====================================================
 def safe_wkb_load(x):
     if isinstance(x, str):
@@ -48,7 +48,7 @@ def safe_wkb_load(x):
 
 
 # =====================================================
-# 🧩 Iterar coords de cualquier geometría (lat, lon)
+# Iterar coords de cualquier geometría (lat, lon)
 # =====================================================
 def iter_coords(geom):
     if geom is None:
@@ -74,7 +74,7 @@ def iter_coords(geom):
 
 
 # =====================================================
-# 🔷 Geometría → lista de hexágonos H3 (por vértices)
+# Geometría → lista de hexágonos H3 (por vértices)
 # =====================================================
 def geometry_to_h3_list(geometry, resolution):
     if geometry is None or geometry.is_empty:
@@ -84,7 +84,7 @@ def geometry_to_h3_list(geometry, resolution):
 
 
 # =====================================================
-# 🚍 Construir huella H3 desde catálogo CSV
+# Construir huella H3 desde catálogo CSV
 # =====================================================
 def build_h3_from_catalog(config):
     # --- Config con defaults seguros ---
@@ -122,7 +122,7 @@ def build_h3_from_catalog(config):
 
 
 # =====================================================
-# ▶️ Main
+# Main
 # =====================================================
 if __name__ == "__main__":
     config = load_config()
