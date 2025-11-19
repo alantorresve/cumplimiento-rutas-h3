@@ -101,7 +101,7 @@ python src\pipeline.py --mode new
 ```toml
 [spatial]
 crs_wgs84 = "EPSG:4326"
-h3_res = 8
+h3_res = 7
 kring = 0
 sampling_meters = 10
 
